@@ -36,12 +36,18 @@ typedef struct {
 
 constexpr int shapeDim = 6; // Number of dimensions in VelaIO
 
+constexpr int kVelaWeightRegion = 0;
+constexpr int kVelaScratchRegion = 1;
+constexpr int kVelaFastScratchRegion = 2;
+constexpr int kVelaInputRegion = 3;
+constexpr int kVelaOutputRegion = 4;
+
 // A Vela input or output descriptor in the binary stream
 typedef struct {
   int shape[shapeDim]; // Shape of input or output
   int elem_size; // Element sizeof in bytes
   int offset; // Offset in bytes within SRAM working data
-  int region; // Scratch region this belongs to
+  int region; // Vela base region this belongs to
 } VelaIO;
 
 // A list of VelaIOs from the binary stream

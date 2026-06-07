@@ -54,6 +54,86 @@ namespace arm {
 
 struct PlatformState {};
 
+namespace {
+
+// Sets a base address for a direct IO region,
+// checking that the provided tensor data pointer and offset are consistent
+Error set_direct_io_base(
+    const char* io_name,
+    int io_index,
+    int region,
+    uint64_t* bases,
+    size_t* bases_size,
+    bool* bases_set,
+    int* num_base_addr,
+    const void* data,
+    size_t data_size,
+    int offset) {
+  if (region < 0 || region >= kEthosUMaxBaseAddrCount) {
+    ET_LOG(
+        Error,
+        "%s %d uses unsupported Vela region %d",
+        io_name,
+        io_index,
+        region);
+    return Error::InvalidProgram;
+  }
+  if (offset < 0) {
+    ET_LOG(Error, "%s %d has negative offset %d", io_name, io_index, offset);
+    return Error::InvalidProgram;
+  }
+  const size_t region_offset = static_cast<size_t>(offset);
+  if (data_size > SIZE_MAX - region_offset) {
+    ET_LOG(Error, "%s %d direct IO range overflows", io_name, io_index);
+    return Error::InvalidProgram;
+  }
+
+  const uintptr_t data_addr = reinterpret_cast<uintptr_t>(data);
+  if (data_addr < region_offset) {
+    ET_LOG(
+        Error,
+        "%s %d direct IO offset exceeds tensor address",
+        io_name,
+        io_index);
+    return Error::InvalidProgram;
+  }
+
+  const uintptr_t base_addr = data_addr - region_offset;
+  if ((base_addr & 0xFUL) != 0) {
+    ET_LOG(
+        Error,
+        "%s %d direct IO base is not 16-byte aligned",
+        io_name,
+        io_index);
+    return Error::InvalidProgram;
+  }
+
+  const uint64_t base = static_cast<uint64_t>(base_addr);
+  const size_t required_size = region_offset + data_size;
+  if (!bases_set[region]) {
+    bases[region] = base;
+    bases_size[region] = required_size;
+    bases_set[region] = true;
+  } else if (bases[region] != base) {
+    ET_LOG(
+        Error,
+        "%s %d is not contiguous with other tensors in Vela region %d",
+        io_name,
+        io_index,
+        region);
+    return Error::InvalidProgram;
+  } else if (required_size > bases_size[region]) {
+    bases_size[region] = required_size;
+  }
+
+  if (*num_base_addr < region + 1) {
+    *num_base_addr = region + 1;
+  }
+  return Error::Ok;
+}
+
+} // namespace
+
 PlatformState* platform_init(
     executorch::runtime::ArrayRef<executorch::runtime::CompileSpec> /*specs*/,
     executorch::runtime::MemoryAllocator* /*allocator*/) {
@@ -92,24 +172,107 @@ Error platform_execute(
     return Error::InvalidState;
   }
 
-  // Ethos-U low level driver expected order for Ethos U-55, we have
-  // constant weight data, then scratch (which contains input and output)
-  // scratch is written above in this function.
-  uint64_t bases[ETHOSU_NUM_BASE_ADDRS] = {
-      static_cast<uint64_t>(reinterpret_cast<uintptr_t>((handles.weight_data))),
-      static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ethosu_scratch)),
-      static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ethosu_fast_scratch))};
-  size_t bases_size[ETHOSU_NUM_BASE_ADDRS] = {
-      handles.weight_data_size,
-      handles.scratch_data_size,
-      ethosu_fast_scratch_size};
+  uint64_t bases[kEthosUMaxBaseAddrCount] = {};
+  size_t bases_size[kEthosUMaxBaseAddrCount] = {};
+  bool bases_set[kEthosUMaxBaseAddrCount] = {};
+  bases[kVelaWeightRegion] =
+      static_cast<uint64_t>(reinterpret_cast<uintptr_t>(handles.weight_data));
+  bases_size[kVelaWeightRegion] = handles.weight_data_size;
+  bases_set[kVelaWeightRegion] = true;
+  bases[kVelaScratchRegion] =
+      static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ethosu_scratch));
+  bases_size[kVelaScratchRegion] = handles.scratch_data_size;
+  bases_set[kVelaScratchRegion] = true;
+  bases[kVelaFastScratchRegion] =
+      static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ethosu_fast_scratch));
+  bases_size[kVelaFastScratchRegion] = ethosu_fast_scratch_size;
+  bases_set[kVelaFastScratchRegion] = true;
+
+  int num_base_addr = kEthosUDefaultBaseAddrCount;
+
+  for (int i = 0; i < input_count; ++i) {
+    const VelaIO& input_io = handles.inputs->io[i];
+    if (input_io.region == kVelaScratchRegion) {
+      continue;
+    }
+    if (input_io.region != kVelaInputRegion) {
+      ET_LOG(
+          Error,
+          "Input %d uses unsupported Vela region %d",
+          i,
+          input_io.region);
+      return Error::InvalidProgram;
+    }
+
+    auto tensor_in = args[i]->toTensor();
+    Error status = set_direct_io_base(
+        "Input",
+        i,
+        input_io.region,
+        bases,
+        bases_size,
+        bases_set,
+        &num_base_addr,
+        tensor_in.const_data_ptr<char>(),
+        tensor_in.nbytes(),
+        input_io.offset);
+    if (status != Error::Ok) {
+      return status;
+    }
+  }
+
+  for (int i = 0; i < output_count; ++i) {
+    VelaIO& output_io = handles.outputs->io[i];
+    if (output_io.region == kVelaScratchRegion) {
+      continue;
+    }
+    if (output_io.region != kVelaOutputRegion) {
+      ET_LOG(
+          Error,
+          "Output %d uses unsupported Vela region %d",
+          i,
+          output_io.region);
+      return Error::InvalidProgram;
+    }
+
+    int tensor_count = 1, io_count = 1;
+    auto tensor_out = args[input_count + i]->toTensor();
+    calculate_dimensions(tensor_out, &output_io, &tensor_count, &io_count);
+    const size_t tensor_bytes = tensor_out.nbytes();
+    const size_t io_bytes = static_cast<size_t>(io_count) *
+        static_cast<size_t>(output_io.elem_size);
+    if (tensor_bytes != io_bytes) {
+      ET_LOG(
+          Error,
+          "Output %d with direct Vela region %d requires layout adjustment",
+          i,
+          output_io.region);
+      return Error::InvalidProgram;
+    }
+
+    Error status = set_direct_io_base(
+        "Output",
+        i,
+        output_io.region,
+        bases,
+        bases_size,
+        bases_set,
+        &num_base_addr,
+        tensor_out.mutable_data_ptr<char>(),
+        tensor_bytes,
+        output_io.offset);
+    if (status != Error::Ok) {
+      return status;
+    }
+  }
+
   int result = ethosu_invoke_v3(
       driver.get(),
       static_cast<const void*>(handles.cmd_data),
       handles.cmd_data_size,
       bases,
       bases_size,
-      ETHOSU_NUM_BASE_ADDRS, /* fixed array of pointers to binary interface*/
+      num_base_addr,
       nullptr);
 
   if (result != 0) {
@@ -119,35 +282,64 @@ Error platform_execute(
 
   size_t tensor_bytes_total = 0;
   size_t io_bytes_total = 0;
-  // Write outputs from scratch into EValue pointers
+  // Scratch-region outputs are copied into EValue tensors; direct outputs have
+  // already been written there by the driver.
   for (int i = 0; i < output_count; i++) {
     int tensor_count = 1, io_count = 1;
-    const char* output_addr = ethosu_scratch + handles.outputs->io[i].offset;
-    // Process input EValue into scratch
-    // Outputs are in the index immediately after inputs
+    VelaIO& output_io = handles.outputs->io[i];
+    // Outputs are in the index immediately after inputs.
     auto tensor_out = args[input_count + i]->toTensor();
 
-    calculate_dimensions(
-        tensor_out, &handles.outputs->io[i], &tensor_count, &io_count);
+    calculate_dimensions(tensor_out, &output_io, &tensor_count, &io_count);
 
     size_t tensor_bytes = tensor_out.nbytes();
     size_t io_bytes = static_cast<size_t>(io_count) *
-        static_cast<size_t>(handles.outputs->io[i].elem_size);
+        static_cast<size_t>(output_io.elem_size);
 
-    if (tensor_bytes != io_bytes) {
-      Error status = copy_with_layout_adjustment(
-          handles.outputs->io[i], i, output_addr, tensor_out, tensor_bytes);
-      if (status != Error::Ok) {
-        return status;
+    if (output_io.region == kVelaOutputRegion) {
+      if (tensor_bytes != io_bytes) {
+        ET_LOG(Error, "Output tensor sizes do not match");
+        return Error::InvalidProgram;
       }
-      io_bytes_total += tensor_bytes;
-    } else {
-      // Routed through arm_ethos_io_memcpy so firmware can DMA-accelerate.
-      arm_ethos_io_memcpy(
-          tensor_out.mutable_data_ptr<char>(),
-          static_cast<const char*>(output_addr),
-          tensor_bytes);
       io_bytes_total += io_bytes;
+    } else if (output_io.region == kVelaScratchRegion) {
+      if (output_io.offset < 0) {
+        ET_LOG(
+            Error,
+            "Output %d has negative scratch offset %d",
+            i,
+            output_io.offset);
+        return Error::InvalidProgram;
+      }
+      const size_t output_offset = static_cast<size_t>(output_io.offset);
+      if (output_offset > handles.scratch_data_size ||
+          io_bytes > handles.scratch_data_size - output_offset) {
+        ET_LOG(Error, "Output %d scratch range exceeds scratch buffer size", i);
+        return Error::InvalidProgram;
+      }
+      const char* output_addr = ethosu_scratch + output_offset;
+      if (tensor_bytes != io_bytes) {
+        Error status = copy_with_layout_adjustment(
+            output_io, i, output_addr, tensor_out, tensor_bytes);
+        if (status != Error::Ok) {
+          return status;
+        }
+        io_bytes_total += tensor_bytes;
+      } else {
+        // Routed through arm_ethos_io_memcpy so firmware can DMA-accelerate.
+        arm_ethos_io_memcpy(
+            tensor_out.mutable_data_ptr<char>(),
+            static_cast<const char*>(output_addr),
+            tensor_bytes);
+        io_bytes_total += io_bytes;
+      }
+    } else {
+      ET_LOG(
+          Error,
+          "Output %d uses unsupported Vela region %d",
+          i,
+          output_io.region);
+      return Error::InvalidProgram;
     }
 
     // At times the topological order of the outputs may change.

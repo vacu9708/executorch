@@ -57,11 +57,12 @@ class EventTraceScope {
 #define EXECUTORCH_PROF_END(EVENTTRACER, SCOPE)
 #endif
 
-#define ETHOSU_NUM_BASE_ADDRS 3
-
 namespace executorch {
 namespace backends {
 namespace arm {
+
+constexpr int kEthosUDefaultBaseAddrCount = kVelaFastScratchRegion + 1;
+constexpr int kEthosUMaxBaseAddrCount = kVelaOutputRegion + 1;
 
 struct PlatformState;
 
